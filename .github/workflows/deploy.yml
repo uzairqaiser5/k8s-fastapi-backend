@@ -4,9 +4,11 @@ on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 jobs:
-  build-and-deploy:
+  build-and-push:
+    name: Build & Push Docker Image
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Code
@@ -18,25 +20,90 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build & Push Docker Image
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and Push Backend Image
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/fastapi-backend:${{ github.sha }},${{ secrets.DOCKERHUB_USERNAME }}/fastapi-backend:latest
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/fastapi-backend:${{ github.sha }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/fastapi-backend:latest
 
-      - name: Deploy to K8s via Master Node SSH
+  deploy-to-k8s:
+    name: Deploy to Kubernetes Cluster via SSH
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Execute Deployment on Control Plane
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.K8S_MASTER_IP }}
           username: ${{ secrets.K8S_SSH_USER }}
           key: ${{ secrets.K8S_SSH_KEY }}
+          port: 22
           script: |
+            # 1. Create directory for manifests
             mkdir -p ~/app-manifests
+
+            # 2. Ensure namespace exists
+            kubectl create namespace three-tier-app --dry-run=client -o yaml | kubectl apply -f -
+
+            # 3. Write complete backend manifest directly
             cat << 'EOF' > ~/app-manifests/backend.yaml
-            ${{ steps.manifest.outputs.content }}
+            apiVersion: apps/v1
+            kind: Deployment
+            metadata:
+              name: fastapi-backend
+              namespace: three-tier-app
+            spec:
+              replicas: 2
+              selector:
+                matchLabels:
+                  app: fastapi-backend
+              template:
+                metadata:
+                  labels:
+                    app: fastapi-backend
+                spec:
+                  containers:
+                    - name: backend
+                      image: DOCKER_IMAGE_TAG
+                      imagePullPolicy: Always
+                      ports:
+                        - containerPort: 8000
+                      env:
+                        - name: DB_HOST
+                          value: "postgres-service"
+                        - name: DB_NAME
+                          value: "appdb"
+                        - name: DB_USER
+                          value: "dbuser"
+                        - name: DB_PASSWORD
+                          value: "securepassword123"
+            ---
+            apiVersion: v1
+            kind: Service
+            metadata:
+              name: fastapi-service
+              namespace: three-tier-app
+            spec:
+              type: NodePort
+              ports:
+                - port: 8000
+                  targetPort: 8000
+                  nodePort: 30008
+              selector:
+                app: fastapi-backend
             EOF
-            # Replace placeholder with new tag and apply
-            sed -i "s|DOCKER_IMAGE_PLACEHOLDER|${{ secrets.DOCKERHUB_USERNAME }}/fastapi-backend:${{ github.sha }}|g" ~/app-manifests/backend.yaml
+
+            # 4. Replace tag with the SHA generated in this run
+            sed -i "s|DOCKER_IMAGE_TAG|${{ secrets.DOCKERHUB_USERNAME }}/fastapi-backend:${{ github.sha }}|g" ~/app-manifests/backend.yaml
+
+            # 5. Apply manifest
             kubectl apply -f ~/app-manifests/backend.yaml
+
+            # 6. Wait for rollout
             kubectl rollout status deployment/fastapi-backend -n three-tier-app --timeout=120s
