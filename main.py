@@ -5,7 +5,7 @@ from pydantic import BaseModel
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-app = FastAPI()
+app = FastAPI(title="Kubernetes CRUD API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -45,6 +45,7 @@ def setup_db():
 class Message(BaseModel):
     content: str
 
+# 1. READ (Get all messages)
 @app.get("/api/messages")
 def read_messages():
     conn = get_db_connection()
@@ -55,6 +56,7 @@ def read_messages():
     conn.close()
     return messages
 
+# 2. CREATE (Add a new message)
 @app.post("/api/messages")
 def create_message(msg: Message):
     if not msg.content.strip():
@@ -67,4 +69,33 @@ def create_message(msg: Message):
     cursor.close()
     conn.close()
     return {"id": new_id, "content": msg.content}
-    print("Uzair)")
+
+# 3. UPDATE (Edit an existing message)
+@app.put("/api/messages/{message_id}")
+def update_message(message_id: int, msg: Message):
+    if not msg.content.strip():
+        raise HTTPException(status_code=400, detail="Content cannot be empty")
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE messages SET content = %s WHERE id = %s RETURNING id;", (msg.content, message_id))
+    updated = cursor.fetchone()
+    conn.commit()
+    cursor.close()
+    conn.close()
+    if not updated:
+        raise HTTPException(status_code=404, detail="Message not found")
+    return {"id": message_id, "content": msg.content}
+
+# 4. DELETE (Remove a message)
+@app.delete("/api/messages/{message_id}")
+def delete_message(message_id: int):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM messages WHERE id = %s RETURNING id;", (message_id,))
+    deleted = cursor.fetchone()
+    conn.commit()
+    cursor.close()
+    conn.close()
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Message not found")
+    return {"detail": "Message deleted successfully", "id": message_id}
